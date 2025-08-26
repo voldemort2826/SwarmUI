@@ -1,24 +1,24 @@
-﻿using FreneticUtilities.FreneticExtensions;
-using FreneticUtilities.FreneticToolkit;
-using Microsoft.AspNetCore.Http;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
-using SwarmUI.Backends;
-using SwarmUI.Core;
+﻿using System.Diagnostics;
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
-using System.Net;
-using System.Diagnostics;
-using SwarmUI.Text2Image;
-using System.Net.Sockets;
-using Microsoft.VisualBasic.FileIO;
+using FreneticUtilities.FreneticExtensions;
+using FreneticUtilities.FreneticToolkit;
 using Microsoft.AspNetCore.Cryptography.KeyDerivation;
+using Microsoft.AspNetCore.Http;
+using Microsoft.VisualBasic.FileIO;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using SwarmUI.Backends;
+using SwarmUI.Core;
+using SwarmUI.Text2Image;
 
 namespace SwarmUI.Utils;
 
@@ -679,185 +679,206 @@ public static class Utilities
     /// <summary>Downloads a file from a given URL and saves it to a given filepath.</summary>
     public static async Task DownloadFile(string url, string filepath, Action<long, long, long> progressUpdate, CancellationTokenSource cancel = null, string altUrl = null, string verifyHash = null, Dictionary<string, string> headers = null)
     {
+        const int MAX_RETRIES = 3;
+
         altUrl ??= url;
         cancel ??= new();
         using CancellationTokenSource combinedCancel = CancellationTokenSource.CreateLinkedTokenSource(Program.GlobalProgramCancel, cancel.Token);
         Directory.CreateDirectory(Path.GetDirectoryName(filepath));
-        using FileStream writer = File.OpenWrite(filepath);
+
+        long startPosition = 0;
+        if (File.Exists(filepath))
+        {
+            FileInfo existingFile = new(filepath);
+            startPosition = existingFile.Length;
+            Logs.Info($"Resuming download from position {new MemoryNum(startPosition)}");
+        }
+
+        for (int retry = 0; retry <= MAX_RETRIES; retry++)
+        {
+            try
+            {
+                await DownloadWithResume(url, filepath, startPosition, progressUpdate, combinedCancel, headers, verifyHash, altUrl);
+                return;
+            }
+            catch (HttpIOException ex) when (retry < MAX_RETRIES)
+            {
+                Logs.Warning($"Download attempt {retry + 1} failed with network error: {ex.Message}. Retrying in {(retry + 1) * 2} seconds...");
+                await Task.Delay(TimeSpan.FromSeconds((retry + 1) * 2), combinedCancel.Token);
+
+                if (File.Exists(filepath))
+                {
+                    FileInfo partialFile = new(filepath);
+                    startPosition = partialFile.Length;
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                if (File.Exists(filepath)) File.Delete(filepath);
+                throw;
+            }
+            catch (SwarmReadableErrorException) when (retry < MAX_RETRIES && !cancel.IsCancellationRequested)
+            {
+                Logs.Warning($"Download attempt {retry + 1} failed. Retrying in {(retry + 1) * 2} seconds...");
+                await Task.Delay(TimeSpan.FromSeconds((retry + 1) * 2), combinedCancel.Token);
+            }
+        }
+
+        if (File.Exists(filepath)) File.Delete(filepath);
+        throw new SwarmReadableErrorException($"Failed to download {altUrl} after {MAX_RETRIES + 1} attempts");
+    }
+
+    private static async Task DownloadWithResume(string url, string filepath, long startPosition, Action<long, long, long> progressUpdate, CancellationTokenSource combinedCancel, Dictionary<string, string> headers, string verifyHash, string altUrl)
+    {
+        // Get header for range support
+        HttpRequestMessage headRequest = new(HttpMethod.Head, url);
+        if (headers != null)
+        {
+            foreach ((string key, string value) in headers)
+            {
+                headRequest.Headers.Add(key, value);
+            }
+        }
+
+        using HttpResponseMessage headResponse = await UtilWebClient.SendAsync(headRequest, combinedCancel.Token);
+        if (headResponse.StatusCode != HttpStatusCode.OK)
+        {
+            throw new SwarmReadableErrorException($"Failed to get file info for {altUrl}: got response code {(int)headResponse.StatusCode} {headResponse.StatusCode}");
+        }
+
+        long totalLength = headResponse.Content.Headers.ContentLength ?? 0;
+        bool supportsRanges = headResponse.Headers.AcceptRanges?.Contains("bytes") == true;
+
+        if (startPosition > 0 && !supportsRanges)
+        {
+            Logs.Warning("Server doesn't support range requests, starting download from beginning");
+            if (File.Exists(filepath)) File.Delete(filepath);
+            startPosition = 0;
+        }
+
+        if (startPosition >= totalLength)
+        {
+            Logs.Info("File downloaded");
+            if (verifyHash != null) await VerifyFileHash(filepath, verifyHash, altUrl);
+            return;
+        }
+
+        // Create download request
         HttpRequestMessage request = new(HttpMethod.Get, url);
-        if (headers is not null)
+        if (headers != null)
         {
             foreach ((string key, string value) in headers)
             {
                 request.Headers.Add(key, value);
             }
         }
-        using HttpResponseMessage response = await UtilWebClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, Program.GlobalProgramCancel);
-        long length = response.Content.Headers.ContentLength ?? 0;
-        ConcurrentQueue<byte[]> chunks = new();
-        ConcurrentQueue<(long, long, long, bool)> progUpdates = new();
-        if (response.StatusCode != HttpStatusCode.OK)
+
+        if (startPosition > 0 && supportsRanges)
+        {
+            request.Headers.Range = new RangeHeaderValue(startPosition, null);
+        }
+
+        using HttpResponseMessage response = await UtilWebClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, combinedCancel.Token);
+
+        if (response.StatusCode != HttpStatusCode.OK && response.StatusCode != HttpStatusCode.PartialContent)
         {
             throw new SwarmReadableErrorException($"Failed to download {altUrl}: got response code {(int)response.StatusCode} {response.StatusCode}");
         }
+
+        long contentLength = response.Content.Headers.ContentLength ?? 0;
+        long expectedTotal = startPosition > 0 ? startPosition + contentLength : totalLength;
+
         using Stream dlStream = await response.Content.ReadAsStreamAsync();
-        Task loadData = Task.Run(async () =>
+        using FileStream writer = startPosition > 0 ? File.OpenWrite(filepath) : File.Create(filepath);
+
+        if (startPosition > 0)
         {
-            try
-            {
-                byte[] buffer = new byte[Math.Min(length + 1024, 1024 * 1024 * 64)]; // up to 64 megabytes, just grab as big a chunk as we can at a time
-                int nextOffset = 0;
-                while (true)
-                {
-                    using CancellationTokenSource delayCleanup = new();
-                    Task<int> readTask = Task.Run(async () => await dlStream.ReadAsync(buffer.AsMemory(nextOffset), combinedCancel.Token));
-                    Task waiting = Task.Delay(TimeSpan.FromMinutes(2), delayCleanup.Token);
-                    Task reading = Task.Run(async () => await readTask);
-                    Task first = await Task.WhenAny(waiting, reading);
-                    if (first == waiting)
-                    {
-                        Logs.Warning($"Download from '{altUrl}' has had no update for 2 minutes. Download may be failing. Will wait 3 more minutes and consider failed if it exceeds 5 total minutes.");
-                        Task waiting2 = Task.Delay(TimeSpan.FromMinutes(3), delayCleanup.Token);
-                        Task second = await Task.WhenAny(waiting2, reading);
-                        if (second == waiting2)
-                        {
-                            chunks.Enqueue(null);
-                            throw new SwarmReadableErrorException("Download timed out, 5 minutes with no new data over stream.");
-                        }
-                        Logs.Info($"Download progressed before timeout, continuing as normal (received {new MemoryNum(await readTask)}).");
-                    }
-                    delayCleanup.Cancel();
-                    int read = await readTask;
-                    if (read <= 0)
-                    {
-                        if (nextOffset > 0)
-                        {
-                            chunks.Enqueue(buffer[..nextOffset]);
-                        }
-                        chunks.Enqueue(null);
-                        break;
-                    }
-                    if (nextOffset + read < 1024 * 1024 * 5)
-                    {
-                        nextOffset += read;
-                    }
-                    else
-                    {
-                        chunks.Enqueue(buffer[..(nextOffset + read)]);
-                        nextOffset = 0;
-                    }
-                    if (cancel is not null && cancel.IsCancellationRequested)
-                    {
-                        chunks.Enqueue(null);
-                        break;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Logs.Error($"Download from '{altUrl}' failed in loadData with internal exception: {ex.ReadableString()}");
-                chunks.Enqueue(null);
-                throw;
-            }
-        });
-        void removeFile()
-        {
-            writer.Dispose();
-            File.Delete(filepath);
+            writer.Seek(startPosition, SeekOrigin.Begin);
         }
-        Task saveChunks = Task.Run(async () =>
+
+        SHA256 sha256 = startPosition == 0 ? SHA256.Create() : null; // Only hash from beginning
+        byte[] buffer = new byte[1024 * 1024 * 8];
+        long downloaded = startPosition;
+        long lastProgressTime = Environment.TickCount64;
+
+        progressUpdate?.Invoke(downloaded, expectedTotal, 0);
+
+        while (true)
         {
+            using CancellationTokenSource readTimeout = new();
+            readTimeout.CancelAfter(TimeSpan.FromMinutes(2));
+            using CancellationTokenSource combinedReadCancel = CancellationTokenSource.CreateLinkedTokenSource(combinedCancel.Token, readTimeout.Token);
+
+            int bytesRead;
             try
             {
-                long progress = 0;
-                long startTime = Environment.TickCount64;
-                long lastUpdate = startTime;
-                SHA256 sha256 = SHA256.Create();
-                while (true)
-                {
-                    if (chunks.TryDequeue(out byte[] chunk))
-                    {
-                        if (chunk is null)
-                        {
-                            Logs.Verbose($"Download {altUrl} completed with {progress} bytes.");
-                            progUpdates.Enqueue((progress, length, 0, true));
-                            if (length != 0 && progress != length)
-                            {
-                                removeFile();
-                                if (cancel is not null && cancel.IsCancellationRequested)
-                                {
-                                    throw new TaskCanceledException($"Download {altUrl} was cancelled.");
-                                }
-                                throw new SwarmReadableErrorException($"Download {altUrl} failed: expected {length} bytes but got {progress} bytes.");
-                            }
-                            sha256.TransformFinalBlock([], 0, 0);
-                            byte[] hash = sha256.Hash;
-                            string hashStr = BytesToHex(hash).ToLowerFast();
-                            Logs.Verbose($"Raw file hash for {altUrl} is {hashStr}");
-                            if (verifyHash is not null && hashStr != verifyHash.ToLowerFast())
-                            {
-                                removeFile();
-                                throw new SwarmReadableErrorException($"Download {altUrl} failed: expected SHA256 hash {verifyHash} but got {hashStr}.");
-                            }
-                            break;
-                        }
-                        progress += chunk.Length;
-                        long timeNow = Environment.TickCount64;
-                        if (timeNow - lastUpdate > 1000 && chunks.Count < 3)
-                        {
-                            long bytesPerSecond = progress * 1000 / (timeNow - startTime);
-                            Logs.Verbose($"Download {altUrl} now at {new MemoryNum(progress)} / {new MemoryNum(length)}... {(progress / (double)length) * 100:00.0}% ({new MemoryNum(bytesPerSecond)} per sec)");
-                            progUpdates.Enqueue((progress, length, bytesPerSecond, false));
-                            lastUpdate = timeNow;
-                        }
-                        sha256.TransformBlock(chunk, 0, chunk.Length, null, 0);
-                        await writer.WriteAsync(chunk, combinedCancel.Token);
-                    }
-                    else
-                    {
-                        await Task.Delay(TimeSpan.FromSeconds(0.1), combinedCancel.Token);
-                    }
-                }
+                bytesRead = await dlStream.ReadAsync(buffer, combinedReadCancel.Token);
             }
-            catch (Exception ex)
+            catch (OperationCanceledException) when (readTimeout.Token.IsCancellationRequested)
             {
-                Logs.Error($"Download from '{altUrl}' failed in saveChunks with internal exception: {ex.ReadableString()}");
-                removeFile();
-                throw;
+                throw new SwarmReadableErrorException("Download timed out during read operation");
             }
-        });
-        Task sendUpdates = Task.Run(async () =>
+
+            if (bytesRead == 0)
+            {
+                break;
+            }
+
+            await writer.WriteAsync(buffer.AsMemory(0, bytesRead), combinedCancel.Token);
+
+            sha256?.TransformBlock(buffer, 0, bytesRead, null, 0);
+
+            downloaded += bytesRead;
+
+            long currentTime = Environment.TickCount64;
+            if (currentTime - lastProgressTime > 1000)
+            {
+                long bytesPerSecond = (downloaded - startPosition) * 1000 / (currentTime - (lastProgressTime - 1000));
+                Logs.Verbose($"Download {altUrl} now at {new MemoryNum(downloaded)} / {new MemoryNum(expectedTotal)}... {downloaded / (double)expectedTotal * 100:00.0}% ({new MemoryNum(bytesPerSecond)} per sec)");
+                progressUpdate?.Invoke(downloaded, expectedTotal, bytesPerSecond);
+                lastProgressTime = currentTime;
+            }
+        }
+
+        writer.Flush();
+
+        if (expectedTotal > 0 && downloaded != expectedTotal)
         {
-            try
+            File.Delete(filepath);
+            throw new SwarmReadableErrorException($"Download {altUrl} incomplete: expected {expectedTotal} bytes but got {downloaded} bytes");
+        }
+
+        if (verifyHash != null && startPosition == 0 && sha256 != null)
+        {
+            sha256.TransformFinalBlock([], 0, 0);
+            string hashStr = BytesToHex(sha256.Hash).ToLowerFast();
+            if (hashStr != verifyHash.ToLowerFast())
             {
-                if (progressUpdate is null)
-                {
-                    return;
-                }
-                progressUpdate(0, length, 0);
-                while (true)
-                {
-                    if (progUpdates.TryDequeue(out (long, long, long, bool) update))
-                    {
-                        progressUpdate(update.Item1, update.Item2, update.Item3);
-                        if (update.Item4)
-                        {
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        await Task.Delay(TimeSpan.FromSeconds(0.1), combinedCancel.Token);
-                    }
-                }
+                File.Delete(filepath);
+                throw new SwarmReadableErrorException($"Download {altUrl} failed hash verification: expected {verifyHash} but got {hashStr}");
             }
-            catch (Exception ex)
-            {
-                Logs.Error($"Download from '{altUrl}' failed in sendUpdates with internal exception: {ex.ReadableString()}");
-                throw;
-            }
-        });
-        await Task.WhenAll(loadData, saveChunks, sendUpdates);
+        }
+        else if (verifyHash != null)
+        {
+            await VerifyFileHash(filepath, verifyHash, altUrl);
+        }
+
+        Logs.Info($"Download {altUrl} completed successfully: {new MemoryNum(downloaded)} bytes");
+        progressUpdate?.Invoke(downloaded, expectedTotal, 0);
+    }
+
+    private static async Task VerifyFileHash(string filepath, string expectedHash, string altUrl)
+    {
+        using FileStream fs = File.OpenRead(filepath);
+        using SHA256 sha256 = SHA256.Create();
+        byte[] hash = await sha256.ComputeHashAsync(fs);
+        string hashStr = BytesToHex(hash).ToLowerFast();
+
+        if (hashStr != expectedHash.ToLowerFast())
+        {
+            File.Delete(filepath);
+            throw new SwarmReadableErrorException($"File {altUrl} failed hash verification: expected {expectedHash} but got {hashStr}");
+        }
     }
 
     /// <summary>Converts a byte array to a hexadecimal string.</summary>
